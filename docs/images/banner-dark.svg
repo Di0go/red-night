@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="red-night: a truly red screen for night, on KDE Plasma 6">
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.75">
+      <stop offset="0" stop-color="#1c1c1e"/>
+      <stop offset="1" stop-color="#141416"/>
+    </radialGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#2c2c2f"/>
+    </pattern>
+    <mask id="crescent">
+      <rect x="-200" y="-200" width="400" height="400" fill="#000"/>
+      <circle cy="-34" r="92" fill="#fff"/>
+      <circle cx="48" cy="-70" r="78" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="1280" height="420" rx="18" fill="url(#glow)"/>
+  <rect width="1280" height="420" rx="18" fill="url(#dots)" opacity="0.45"/>
+  <rect x="0.5" y="0.5" width="1279" height="419" rx="17.5" fill="none" stroke="#2c2c2f"/>
+
+  <!-- The mark: a crescent moon, and the three gamma ramps it is made of. Red climbs; green and blue lie flat at zero. -->
+  <g transform="translate(300 210)">
+    <rect x="-200" y="-200" width="400" height="400" fill="#d7191c" mask="url(#crescent)"/>
+    <g transform="translate(-66 118)" stroke-linecap="round" stroke-width="7" fill="none">
+      <path d="M0 0 L132 -40" stroke="#d7191c"/>
+      <path d="M0 20 L132 20" stroke="#3a3a3e"/>
+      <path d="M0 38 L132 38" stroke="#3a3a3e"/>
+    </g>
+  </g>
+
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="495" y="178" font-size="88" font-weight="700" letter-spacing="-3" fill="#f2f2f2">red-night</text>
+    <text x="499" y="230" font-size="27" font-weight="500" fill="#a8a8ad">A truly red screen for night, on KDE Plasma 6.</text>
+    <line x1="499" y1="272" x2="559" y2="272" stroke="#d7191c" stroke-width="2.5" stroke-linecap="round"/>
+    <text x="499" y="314" font-size="20" font-style="italic" fill="#a8a8ad">Not the orange of Night Light: green and blue off,</text>
+    <text x="499" y="342" font-size="20" font-style="italic" fill="#a8a8ad">only red left, in the graphics card's own gamma table.</text>
+    <text x="499" y="374" font-size="15" letter-spacing="0.4" fill="#7a7a80">Like the Color Filters red tint on a Mac. No shader, no cost per frame.</text>
+  </g>
+</svg>
