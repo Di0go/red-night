@@ -32,7 +32,7 @@ It is one switch in the tray's Brightness and Color popup, under Night Light, an
 frame: the ramp lives in the graphics card's own gamma table, not in a shader.
 
 <p align="center">
-  <img src="docs/images/tray.webp" alt="The Brightness and Color popup in the Plasma system tray: the screen brightness slider, the Night Light row, and under it a Red Night row with a switch like Night Light's, showing whether it is on and at what level." width="440">
+  <img src="docs/images/tray.webp" alt="The Brightness and Color popup in the Plasma system tray: the screen brightness slider, the Night Light row, and under it a Red Night row with a switch like Night Light's, showing whether it is on and at what level." width="456">
 </p>
 <p align="center"><sub>Screenshots are taken before the gamma table, so the picture shows the screen as it would look with the filter off.</sub></p>
 
