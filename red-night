@@ -6,6 +6,7 @@
   red-night off               put every output back the way it was
   red-night level N|up|down   change the brightness (turns it on)
   red-night status
+  red-night state             one line for scripts: on|off LEVEL
   red-night schedule HH:MM HH:MM   turn on at the first time, off at the second
   red-night schedule off
   red-night auto              apply the schedule now (what the timer runs)
@@ -274,6 +275,8 @@ def main():
         change_level(args[0])
     elif cmd == "status":
         status()
+    elif cmd == "state":
+        print(f"{'on' if is_on() else 'off'} {get_level()}")
     elif cmd == "schedule":
         schedule(args)
     elif cmd == "auto":

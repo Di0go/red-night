@@ -36,16 +36,47 @@ No root needed. This installs:
 | What | Where |
 |---|---|
 | command | `~/.local/bin/red-night` (symlink to this checkout) |
-| menu entry "Red Night" (right-click for On/Off/Brighter/Dimmer; can be dragged to a panel) | `~/.local/share/applications/red-night.desktop` |
-| global shortcuts | kglobalaccel (registered live) and `kglobalshortcutsrc` |
+| menu entry "Red Night" (right-click for On/Off/Brighter/Dimmer) | `~/.local/share/applications/red-night.desktop` |
+| **Red Night switch in the tray**: a pill in the Brightness and Color popup, under Night Light | `~/.local/share/plasma/plasmoids/rednight.brightness/` |
+| the guard for that switch | `~/.config/systemd/user/plasma-plasmashell.service.d/red-night-tray.conf`, `red-night-tray.path`, `red-night-tray.service` |
 
-| Shortcut | Action |
-|---|---|
-| Meta+Ctrl+Alt+R | toggle |
-| Meta+Ctrl+Alt+Up | brighter |
-| Meta+Ctrl+Alt+Down | dimmer |
+There is no keyboard shortcut any more; `install.sh` removes the ones older versions set.
 
-You can rebind them in System Settings › Shortcuts › Red Night.
+## The tray switch
+
+Click the brightness icon in the system tray. Under Night Light there is a **Red Night** row
+with a switch like Night Light's: it turns the filter on and off at the last level, shows
+On/Off and the level, and follows changes made elsewhere (the schedule, the command).
+
+How it is done, and why this way:
+
+- Plasma 6 compiles the stock applet's QML into
+  `/usr/lib/qt6/plugins/plasma/applets/org.kde.plasma.brightness.so` (package `powerdevil`) and
+  prefers that copy, so a same-id package in `~/.local/share/plasma/plasmoids/` is ignored
+  (it only "wins" when its metadata has no `Id`, and then the applet's id becomes `metadata`,
+  which breaks translations, settings and the tray).
+- So `red-night-tray install` builds a copy under its own id, **`rednight.brightness`**, from
+  the QML inside the *installed* `.so` (read with PySide6), adds `tray/RedNightItem.qml`
+  before the Theme row, keeps the stock translations, compiles it to check it, and swaps it
+  into the tray in place of `org.kde.plasma.brightness` (live, through plasmashell's
+  scripting interface; no restart).
+- The copy uses powerdevil's private QML plugin, so it must match the installed powerdevil.
+  **The guard** (`red-night-tray check`) runs before every plasmashell start (systemd drop-in)
+  and a few seconds after the applet's files change (systemd path unit, i.e. after a
+  `pacman -Syu`). If powerdevil changed, it rebuilds the copy from the new files and checks
+  that it compiles; if that fails for any reason, it puts the stock applet back in the tray,
+  removes the copy, writes the reason to `~/.local/state/red-night/tray-error` and sends a
+  notification. Either way you keep the brightness slider.
+
+```sh
+red-night-tray status    # copy built from which powerdevil, what the tray shows, guard
+red-night-tray remove    # back to the stock Brightness and Color, copy and guard removed
+red-night-tray install   # again
+```
+
+If the popup ever shows an error instead of the sliders (for example plasmashell was
+restarted by hand right after an update, so the guard had not run yet), run
+`red-night-tray check` or `red-night-tray remove`.
 
 ## Use
 
@@ -55,6 +86,7 @@ red-night on [LEVEL]          # LEVEL 1-100, red brightness; default is the last
 red-night off
 red-night level up|down|N     # steps: 2 5 10 20 30 … 100
 red-night status
+red-night state               # one line for scripts: on|off LEVEL
 red-night schedule 22:00 07:00   # systemd user timer; catches up after sleep/boot
 red-night schedule off
 ```
@@ -65,15 +97,16 @@ red-night schedule off
 ./uninstall.sh
 ```
 
-This restores every output's colour profile, removes the schedule timer, unregisters the
-shortcuts and deletes the menu entry, the command, the generated profiles and the
-settings. The checkout itself is left in place.
+This restores every output's colour profile, puts the stock Brightness and Color back in
+the tray, removes the schedule timer and the guard, and deletes the menu entry, the
+command, the generated profiles and the settings. The checkout itself is left in place.
 
 ## Tests
 
 ```sh
 tests/profile-test.py   # generates profiles, reads them back with lcms: red = x·level, green = blue = 0
-tests/screen-test.sh    # REAL SCREEN, ~3 s red: fires the shortcuts and reads the hardware LUT, always reverts
+tests/screen-test.sh    # REAL SCREEN, ~3 s red: runs on/brighter/dimmer/off and reads the hardware LUT, always reverts
+tests/tray-test.py      # the tray guard, offline in temp dirs: build, swap, rebuild after an update, fall back to stock
 tests/crtc-lut.py       # print the GAMMA_LUT the kernel is scanning out right now (modetest, no root)
 ```
 

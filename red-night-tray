@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""red-night-tray: a Red Night switch inside Plasma's Brightness and Color popup.
+
+  red-night-tray install   build the applet, swap it into the system tray, install the guard
+  red-night-tray remove    put the stock Brightness and Color applet back, remove all of this
+  red-night-tray check     the guard: rebuild if powerdevil changed, or go back to stock
+  red-night-tray status
+
+Plasma loads the stock applet's QML from inside its .so, so a same-id copy in
+~/.local/share/plasma/plasmoids is not used. Instead this builds a copy under its own id
+(rednight.brightness) from the QML of the *installed* applet, adds RedNightItem.qml after
+the Night Light row, and puts it in the tray in place of org.kde.plasma.brightness.
+
+The copy uses powerdevil's private QML plugin, so it must match the installed powerdevil.
+The guard runs before every plasmashell start (systemd drop-in) and whenever the applet's
+files change (systemd path unit): if they changed it rebuilds the copy from the new
+files and checks that it compiles; if that fails it puts the stock applet back.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOME = Path.home()
+DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "red-night"
+UNITS = CONFIG / "systemd/user"
+DROPIN = UNITS / "plasma-plasmashell.service.d/red-night-tray.conf"
+PATH_UNIT, SERVICE_UNIT = UNITS / "red-night-tray.path", UNITS / "red-night-tray.service"
+APPLETSRC = CONFIG / "plasma-org.kde.plasma.desktop-appletsrc"
+
+STOCK = "org.kde.plasma.brightness"
+FORK = "rednight.brightness"
+PKG = DATA / "plasma/plasmoids" / FORK
+SOURCE_FILE = "red-night-source.json"  # inside PKG: fingerprint of what it was built from
+DOMAIN = "plasma_applet_" + STOCK      # keep the stock translations
+QT = Path(os.environ.get("RED_NIGHT_QT_PREFIX", "/usr/lib/qt6"))
+APPLET_SO = QT / "plugins/plasma/applets" / f"{STOCK}.so"
+PRIVATE_DIR = QT / "qml/org/kde/plasma/private/brightnesscontrolplugin"
+PRIVATE_SO = PRIVATE_DIR / "libbrightnesscontrolplugin.so"
+
+
+# For the helper Qt processes: no window, and no session bus, so they do not start portals or
+# the accessibility bus (the guard also runs before plasmashell, early in the session).
+QT_ENV = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"}
+
+
+def log(msg):
+    print(f"red-night-tray: {msg}", file=sys.stderr)
+
+
+# --- building the applet ----------------------------------------------------
+
+def fingerprint():
+    """What the copy depends on: the stock applet and powerdevil's private QML plugin."""
+    fp = {}
+    for f in (APPLET_SO, PRIVATE_SO):
+        fp[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+    version = PRIVATE_DIR / "kde-qmlmodule.version"
+    fp["version"] = version.read_text().strip() if version.exists() else "?"
+    return fp
+
+
+def built_from():
+    try:
+        return json.loads((PKG / SOURCE_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def extract_stock():
+    """{file name: text} of the stock applet's QML, and its metadata, read from the installed .so.
+
+    In a separate process, so it always reads the .so on disk, not one already loaded here."""
+    code = r"""
+import ctypes, json, sys
+from PySide6.QtCore import QCoreApplication, QDirIterator, QFile, QIODevice, QPluginLoader
+so, root = sys.argv[1:]
+app = QCoreApplication(sys.argv[:1])  # Qt resources need one
+meta = QPluginLoader(so).metaData().get("MetaData")
+ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)  # registers its Qt resources
+files = {}
+it = QDirIterator(root, QDirIterator.IteratorFlag.Subdirectories)
+while it.hasNext():
+    path = it.next()
+    f = QFile(path)
+    if path.endswith(".qml") and f.open(QIODevice.OpenModeFlag.ReadOnly):
+        files[path.rsplit("/", 1)[1]] = bytes(f.readAll()).decode()
+json.dump({"files": files, "meta": meta}, sys.stdout)
+"""
+    root = f":/qt/qml/plasma/applet/{STOCK.replace('.', '/')}"
+    r = subprocess.run([sys.executable, "-I", "-c", code, str(APPLET_SO), root],
+                       capture_output=True, text=True, env=QT_ENV, timeout=60)
+    out = json.loads(r.stdout) if r.returncode == 0 else {}
+    files, meta = out.get("files", {}), out.get("meta")
+    if not meta or "main.qml" not in files or "PopupDialog.qml" not in files:
+        raise RuntimeError(f"could not read the applet out of {APPLET_SO}: {r.stderr.strip()[-500:]}")
+    return files, meta
+
+
+def patch(files, meta):
+    """Our copy: own id, stock translations, Red Night row after Night Light."""
+    # i18n() looks in plasma_applet_<our id>; point every call at the stock catalogue.
+    for name, text in files.items():
+        files[name] = re.sub(r"\bi18n(c|p|cp)?\(", lambda m: f'i18nd{m.group(1) or ""}("{DOMAIN}", ', text)
+
+    dialog = files["PopupDialog.qml"]
+    anchor = re.findall(r"^( *)DarkModeItem \{", dialog, re.M)
+    if len(anchor) != 1 or "NightLightItem {" not in dialog:
+        raise RuntimeError("PopupDialog.qml changed shape: no single 'DarkModeItem {' after the Night Light row")
+    indent = anchor[0]
+    item = (f"{indent}RedNightItem {{\n"
+            f"{indent}    Layout.fillWidth: true\n"
+            f"{indent}    command: {json.dumps(str(HERE / 'red-night'))}\n"
+            f"{indent}}}\n\n")
+    files["PopupDialog.qml"] = re.sub(r"^ *DarkModeItem \{", lambda m: item + m.group(0), dialog, count=1, flags=re.M)
+    files["RedNightItem.qml"] = (HERE / "tray/RedNightItem.qml").read_text()
+
+    plugin = {k: v for k, v in meta["KPlugin"].items() if not k.startswith(("Name[", "Description["))}
+    plugin.update(Id=FORK, Name="Brightness & Color (Red Night)", EnabledByDefault=False)
+    meta = {**meta, "KPlugin": plugin, "KPackageStructure": "Plasma/Applet"}
+    return files, meta
+
+
+def validate(pkg):
+    """Compile every QML file of the package in a separate process; raise with the errors."""
+    code = r"""
+import sys
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlComponent, QQmlEngine
+app = QGuiApplication(sys.argv[:1])
+engine = QQmlEngine()
+errors = []
+for path in sys.argv[1:]:
+    c = QQmlComponent(engine, QUrl.fromLocalFile(path))
+    errors += [e.toString() for e in c.errors()]
+print("\n".join(errors))
+sys.exit(1 if errors else 0)
+"""
+    qml = sorted(str(p) for p in (pkg / "contents/ui").glob("*.qml"))
+    r = subprocess.run([sys.executable, "-I", "-c", code, *qml], capture_output=True, text=True, env=QT_ENV, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("the rebuilt applet does not compile:\n" + (r.stdout.strip() or r.stderr.strip()))
+
+
+def build():
+    """Build into a temporary directory, check it, then swap it into place."""
+    fp = fingerprint()
+    files, meta = patch(*extract_stock())
+    PKG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{FORK}.", dir=PKG.parent))
+    try:
+        (tmp / "contents/ui").mkdir(parents=True)
+        for name, text in files.items():
+            (tmp / "contents/ui" / name).write_text(text)
+        (tmp / "metadata.json").write_text(json.dumps(meta, indent=4, ensure_ascii=False) + "\n")
+        (tmp / SOURCE_FILE).write_text(json.dumps(fp, indent=2) + "\n")
+        validate(tmp)
+        old = PKG.with_name(f".{FORK}.old")
+        shutil.rmtree(old, ignore_errors=True)
+        if PKG.exists():
+            PKG.rename(old)
+        tmp.rename(PKG)
+        shutil.rmtree(old, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return fp
+
+
+# --- the system tray --------------------------------------------------------
+
+def plasmashell_running():
+    r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path",
+                        "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner",
+                        "org.kde.plasmashell"], capture_output=True, text=True)
+    return "true" in r.stdout
+
+
+def announce(signal):
+    """Tell the running tray the package changed, as kpackagetool6 does. The tray only learns
+    about new applets this way, and must learn before it is told to show one."""
+    subprocess.run(["gdbus", "emit", "--session", "--object-path", "/KPackage/Plasma/Applet",
+                    "--signal", f"org.kde.plasma.kpackage.{signal}", FORK], capture_output=True)
+
+
+def swap(items, old, new):
+    out = [new if i == old else i for i in items]
+    return [i for n, i in enumerate(out) if i and i not in out[:n]]
+
+
+SWAP_JS = """
+const [oldId, newId, ensure] = [%s, %s, %s];
+const asList = v => Array.isArray(v) ? v.map(String) : String(v || "").split(",").filter(Boolean);
+let trays = 0, swapped = 0;
+for (const panel of panels()) {
+    for (const tray of panel.widgets("org.kde.plasma.systemtray")) {
+        trays++;
+        tray.currentConfigGroup = ["General"];
+        const known = asList(tray.readConfig("knownItems", []));
+        if (!known.includes(newId)) tray.writeConfig("knownItems", known.concat([newId]));
+        for (const key of ["shownItems", "hiddenItems", "extraItems"]) {
+            const items = asList(tray.readConfig(key, []));
+            if (!items.includes(oldId)) continue;
+            const out = items.map(i => i === oldId ? newId : i).filter((i, n, a) => a.indexOf(i) === n);
+            tray.writeConfig(key, out);
+            if (key === "extraItems") swapped++;
+        }
+        const extra = asList(tray.readConfig("extraItems", []));
+        if (ensure && !extra.includes(newId)) {
+            tray.writeConfig("extraItems", extra.concat([newId]));
+            swapped++;
+        }
+    }
+}
+print(`trays=${trays} swapped=${swapped}`);
+"""
+
+
+def tray_groups():
+    """kwriteconfig6 group paths of every system tray's [General], read from the appletsrc file."""
+    groups, current, plugin = [], None, {}
+    for line in APPLETSRC.read_text().splitlines() if APPLETSRC.exists() else []:
+        if line.startswith("["):
+            current = re.findall(r"\[([^\]]*)\]", line)
+        elif current and line.startswith("plugin="):
+            plugin[tuple(current)] = line[7:]
+    for path, name in plugin.items():
+        if name == "org.kde.plasma.systemtray":
+            groups.append([*path, "General"])
+    return groups
+
+
+def swap_tray(old, new, ensure=False):
+    """Replace applet `old` with `new` in every system tray. Live if plasmashell runs, else in the file.
+    With ensure, add `new` even where `old` was not there."""
+    if plasmashell_running():
+        r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.kde.plasmashell", "--object-path",
+                            "/PlasmaShell", "--method", "org.kde.PlasmaShell.evaluateScript",
+                            SWAP_JS % (json.dumps(old), json.dumps(new), json.dumps(ensure))], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"plasmashell refused the script: {r.stderr.strip()}")
+        log(f"tray: {old} -> {new} (live: {r.stdout.strip()})")
+        return
+    for group in tray_groups():
+        args = ["--file", str(APPLETSRC)] + [a for g in group for a in ("--group", g)]
+        for key in ("shownItems", "hiddenItems", "extraItems", "knownItems"):
+            value = subprocess.run(["kreadconfig6", *args, "--key", key], capture_output=True, text=True).stdout.strip()
+            items = [i for i in value.split(",") if i]
+            if key == "knownItems":
+                out = items if new in items else items + [new]
+            else:
+                out = swap(items, old, new)
+                if ensure and key == "extraItems" and new not in out:
+                    out.append(new)
+            if out != items:
+                subprocess.run(["kwriteconfig6", *args, "--key", key, ",".join(out)], check=True)
+    log(f"tray: {old} -> {new} (in {APPLETSRC.name})")
+
+
+def tray_uses(applet):
+    for group in tray_groups():
+        args = ["--file", str(APPLETSRC)] + [a for g in group for a in ("--group", g)]
+        value = subprocess.run(["kreadconfig6", *args, "--key", "extraItems"], capture_output=True, text=True).stdout
+        if applet in value.strip().split(","):
+            return True
+    return False
+
+
+def notify_later(text):
+    """plasmashell is the notification server, and the guard may run before it starts."""
+    subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--on-active=30",
+                    "notify-send", "--app-name=Red Night", "--icon=redshift-status-on", "Red Night", text],
+                   capture_output=True)
+
+
+# --- the guard --------------------------------------------------------------
+
+def install_guard():
+    exe = HERE / "red-night-tray"
+    DROPIN.parent.mkdir(parents=True, exist_ok=True)
+    DROPIN.write_text("# red-night-tray: rebuild the Red Night copy of Brightness and Color, or go back to stock,\n"
+                      "# before plasmashell loads it. '-': never block plasmashell.\n"
+                      f"[Service]\nExecStartPre=-{exe} check\n")
+    PATH_UNIT.write_text("[Unit]\nDescription=red-night-tray: watch the Brightness and Color applet for updates\n\n"
+                         f"[Path]\nPathChanged={APPLET_SO}\nPathChanged={PRIVATE_SO}\n\n"
+                         "[Install]\nWantedBy=paths.target\n")
+    SERVICE_UNIT.write_text("[Unit]\nDescription=red-night-tray: rebuild after a powerdevil update\n\n"
+                            f"[Service]\nType=oneshot\nExecStartPre=/usr/bin/sleep 5\nExecStart={exe} check\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "red-night-tray.path"], check=True, capture_output=True)
+
+
+def remove_guard():
+    subprocess.run(["systemctl", "--user", "disable", "--now", "red-night-tray.path"], capture_output=True)
+    for f in (DROPIN, PATH_UNIT, SERVICE_UNIT):
+        f.unlink(missing_ok=True)
+    try:
+        DROPIN.parent.rmdir()
+    except OSError:
+        pass
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+
+
+def check():
+    if not PKG.exists():
+        return
+    try:
+        fp = fingerprint()
+    except OSError as e:
+        fp = {"error": str(e)}
+    if fp == built_from():
+        return
+    try:
+        build()
+        announce("packageUpdated")
+        log(f"powerdevil changed (now {fp.get('version')}): rebuilt {PKG}")
+        notify_later(f"Rebuilt the Red Night switch for powerdevil {fp.get('version')}.")
+    except Exception as e:  # anything at all: never leave the tray without brightness
+        log(f"rebuild failed, going back to the stock applet: {e}")
+        if tray_uses(FORK) or plasmashell_running():
+            swap_tray(FORK, STOCK)
+        shutil.rmtree(PKG, ignore_errors=True)
+        announce("packageUninstalled")
+        STATE.mkdir(parents=True, exist_ok=True)
+        (STATE / "tray-error").write_text(f"{e}\n")
+        notify_later("powerdevil changed and the Red Night switch could not be rebuilt, so the stock "
+                     f"Brightness and Color is back. Details: {STATE / 'tray-error'}")
+
+
+# --- commands ---------------------------------------------------------------
+
+def install():
+    new = not PKG.exists()
+    fp = build()
+    announce("packageInstalled" if new else "packageUpdated")
+    log(f"built {PKG} from powerdevil {fp['version']}")
+    install_guard()
+    log(f"guard: {DROPIN} and {PATH_UNIT.name}")
+    swap_tray(STOCK, FORK, ensure=True)
+    (STATE / "tray-error").unlink(missing_ok=True)
+
+
+def remove():
+    swap_tray(FORK, STOCK)
+    remove_guard()
+    shutil.rmtree(PKG, ignore_errors=True)
+    announce("packageUninstalled")
+    log("stock Brightness and Color is back; copy and guard removed")
+
+
+def status():
+    built = built_from()
+    print(f"copy: {PKG if built else 'not installed'}")
+    if built:
+        print(f"  built from powerdevil {built.get('version')}, "
+              f"{'matches' if built == fingerprint() else 'DOES NOT match'} the installed one")
+    print(f"tray shows: {', '.join(a for a in (FORK, STOCK) if tray_uses(a)) or 'neither'}")
+    print(f"guard: {'installed' if DROPIN.exists() else 'not installed'}")
+    err = STATE / "tray-error"
+    if err.exists():
+        print(f"last guard error: {err.read_text().strip()}")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    commands = {"install": install, "remove": remove, "check": check, "status": status}
+    if cmd not in commands:
+        sys.exit(__doc__.strip())
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "tray.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        commands[cmd]()
+
+
+if __name__ == "__main__":
+    main()
