@@ -10,17 +10,21 @@
   red-night schedule HH:MM HH:MM   turn on at the first time, off at the second
   red-night schedule off
   red-night auto              apply the schedule now (what the timer runs)
+  red-night leds              port LEDs off if the filter is on, as they were if not (run at login)
 
 How: each output gets an sRGB ICC profile whose VCGT ramp keeps red and zeroes
 green and blue. KWin loads the ramp into the CRTC's hardware GAMMA_LUT, so it
 costs nothing per frame and covers every plane (cursor and fullscreen video too).
+While it is on, the link and activity LEDs of the wired network ports are off.
 """
 import ctypes
+import errno
 import datetime
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HOME = Path.home()
@@ -31,6 +35,8 @@ UNITS = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "systemd/use
 SAVED = STATE / "saved"          # output<TAB>colour profile source<TAB>icc path, before we touched it
 LEVEL_FILE = CONFIG / "level"
 SCHEDULE_FILE = CONFIG / "schedule"
+LEDS = Path(os.environ.get("RED_NIGHT_LEDS", "/sys/class/leds"))
+LED_SAVED = STATE / "lan-leds"   # led<TAB>trigger<TAB>mode=value,..., before we touched it
 STEPS = [2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 DEFAULT_LEVEL = 60
 
@@ -131,6 +137,126 @@ def osd(text):
                       "redshift-status-on", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# --- network port LEDs ------------------------------------------------------
+# Drivers like r8169 run the port LEDs in hardware, through the netdev trigger: activating it
+# reads the LED's mode from the hardware, every mode at 0 turns the LED off, and the hardware
+# keeps the mode when the trigger goes back to none. Writing these files needs the udev rule
+# that tools/lan-leds installs; without it the LEDs are left alone.
+
+NETDEV_MODES = ("link", "link_10", "link_100", "link_1000", "link_2500", "link_5000", "link_10000",
+                "half_duplex", "full_duplex", "rx", "tx")
+LED_WAIT = 2.0  # seconds for udev to hand over the netdev files after the trigger changes
+
+
+def lan_leds():
+    """The *::lan LEDs of the wired network ports."""
+    return [d for d in sorted(LEDS.glob("*::lan"))
+            if not (d / "device/wireless").exists() and not (d / "device/phy80211").exists()]
+
+
+def led_trigger(d):
+    m = re.search(r"\[(.+?)\]", (d / "trigger").read_text())
+    return m.group(1) if m else "none"
+
+
+def led_modes(d):
+    return {m: int((d / m).read_text()) for m in NETDEV_MODES if (d / m).exists()}
+
+
+def sysfs_write(path, value):
+    path.write_text(f"{value}\n")
+
+
+def writable(path):
+    return os.access(path, os.W_OK)
+
+
+def set_modes(d, target):
+    """Write the netdev modes one at a time (some clear others). A step the hardware cannot do on
+    its own, like rx without tx, fails with EOPNOTSUPP; only the end result has to be one it can."""
+    for m in NETDEV_MODES:
+        if m in target and led_modes(d).get(m) != target[m]:
+            try:
+                sysfs_write(d / m, target[m])
+            except OSError as e:
+                if e.errno != errno.EOPNOTSUPP:
+                    raise
+    modes = led_modes(d)
+    offloaded = d / "offloaded"
+    if any(modes.get(m) != v for m, v in target.items()) or (offloaded.exists() and offloaded.read_text().strip() != "1"):
+        raise OSError(errno.EOPNOTSUPP, f"the hardware did not take {target}")
+
+
+def to_netdev(d):
+    """Put the LED on the netdev trigger; False if its mode files do not become writable."""
+    if led_trigger(d) != "netdev":
+        sysfs_write(d / "trigger", "netdev")
+    deadline = time.monotonic() + LED_WAIT
+    while not (modes := led_modes(d)) or not all(writable(d / m) for m in modes):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def read_led_saved():
+    saved = {}
+    if LED_SAVED.exists():
+        for line in LED_SAVED.read_text().splitlines():
+            name, trigger, modes = (line.split("\t") + ["", ""])[:3]
+            saved[name] = (trigger, {k: int(v) for k, v in (kv.split("=") for kv in modes.split(",") if kv)})
+    return saved
+
+
+def write_led_saved(saved):
+    if not saved:
+        LED_SAVED.unlink(missing_ok=True)
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    LED_SAVED.write_text("".join(f"{n}\t{t}\t{','.join(f'{k}={v}' for k, v in m.items())}\n"
+                                 for n, (t, m) in saved.items()))
+
+
+def leds_dark():
+    saved = read_led_saved()
+    for d in lan_leds():
+        if not writable(d / "trigger"):
+            continue
+        try:
+            trigger = led_trigger(d)
+            if not to_netdev(d):
+                sysfs_write(d / "trigger", trigger)
+                print(f"red-night: {d.name}: the netdev settings are not writable, left alone", file=sys.stderr)
+                continue
+            if d.name not in saved:
+                saved[d.name] = (trigger, led_modes(d))
+                write_led_saved(saved)  # saved before switching off, so it can always be undone
+            set_modes(d, dict.fromkeys(led_modes(d), 0))
+        except OSError as e:
+            print(f"red-night: {d.name}: {e}", file=sys.stderr)
+
+
+def leds_restore():
+    saved = read_led_saved()
+    for name, (trigger, modes) in list(saved.items()):
+        d = LEDS / name
+        try:
+            if d.exists():
+                if not to_netdev(d):
+                    raise PermissionError("the netdev settings are not writable")
+                set_modes(d, modes)
+                if trigger != "netdev":
+                    sysfs_write(d / "trigger", trigger)
+            del saved[name]
+        except OSError as e:
+            print(f"red-night: {name}: {e}", file=sys.stderr)
+    write_led_saved(saved)
+
+
+def leds_sync():
+    leds_dark() if is_on() else leds_restore()
+
+
 # --- commands ---------------------------------------------------------------
 
 def get_level():
@@ -166,6 +292,7 @@ def turn_on(level=None, quiet=False):
             args += [f"output.{o['name']}.iccprofile.{icc}", f"output.{o['name']}.colorProfileSource.ICC"]
     write_saved(saved)  # saved before applying, so an interrupted run can still be undone
     kscreen(args)
+    leds_dark()
     if not quiet:
         osd(f"Red night {level}%")
 
@@ -180,6 +307,7 @@ def turn_off(quiet=False):
         args += [f"output.{o['name']}.colorProfileSource.{source or 'sRGB'}", f"output.{o['name']}.iccprofile.{icc}"]
     kscreen(args)
     SAVED.unlink(missing_ok=True)
+    leds_restore()
     if not quiet:
         osd("Red night off")
 
@@ -261,6 +389,11 @@ def status():
         print(f"schedule: on at {start}, off at {end}")
     else:
         print("schedule: none")
+    leds = lan_leds()
+    if leds:
+        dark = sum(d.name in read_led_saved() for d in leds)
+        rule = "" if all(writable(d / "trigger") for d in leds) else " (no udev rule: ./install.sh adds it)"
+        print(f"port LEDs: {dark} of {len(leds)} off{rule}")
 
 
 def main():
@@ -281,6 +414,8 @@ def main():
         schedule(args)
     elif cmd == "auto":
         auto()
+    elif cmd == "leds":
+        leds_sync()
     else:
         sys.exit(__doc__.strip())
 

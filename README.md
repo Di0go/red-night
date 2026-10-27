@@ -29,7 +29,8 @@ has under Color Filters (a red Color Tint at 100 %, with Reduce White Point): wh
 lit.
 
 It is one switch in the tray's Brightness and Color popup, under Night Light, and a command. It costs nothing per
-frame: the ramp lives in the graphics card's own gamma table, not in a shader.
+frame: the ramp lives in the graphics card's own gamma table, not in a shader. While it is on, the link and activity
+LEDs of the wired network ports are off too.
 
 <p align="center">
   <img src="docs/images/tray.webp" alt="The Brightness and Color popup in the Plasma system tray: the screen brightness slider, the Night Light row, and under it a Red Night row with a switch like Night Light's, showing whether it is on and at what level." width="456">
@@ -61,7 +62,8 @@ cd red-night
 ./install.sh
 ```
 
-No root needed. It installs, for the current user:
+It installs, for the current user, and asks for your password once (`pkexec`) for the network port LEDs; with
+`./install.sh --no-leds` it needs no root and leaves them alone:
 
 | What | Where |
 |---|---|
@@ -69,6 +71,8 @@ No root needed. It installs, for the current user:
 | The menu entry "Red Night" | `~/.local/share/applications/red-night.desktop` |
 | The Red Night switch in the tray | `~/.local/share/plasma/plasmoids/rednight.brightness/` |
 | The guard for that switch | `~/.config/systemd/user/plasma-plasmashell.service.d/red-night-tray.conf`, `red-night-tray.path`, `red-night-tray.service` |
+| The port LEDs, as root | `/etc/udev/rules.d/90-red-night-lan-leds.rules`, `/etc/modules-load.d/red-night.conf` ([`tools/lan-leds`](tools/lan-leds)) |
+| The port LEDs at login | `~/.config/systemd/user/red-night-leds.service` |
 
 The checkout is used in place, so keep it where it is. `./install.sh` also removes the global shortcuts an older
 version registered; there are none now.
@@ -79,9 +83,9 @@ version registered; there are none now.
 ./uninstall.sh
 ```
 
-It puts every output's colour profile back, puts the stock Brightness and Color back in the tray, and removes the
-schedule timer, the guard, the menu entry, the command, the generated profiles and the settings. The checkout itself
-is left in place.
+It puts every output's colour profile and the network port LEDs back, puts the stock Brightness and Color back in
+the tray, and removes the LED rule (asking for your password), the schedule timer, the guard, the menu entry, the
+command, the generated profiles and the settings. The checkout itself is left in place.
 
 ## Use
 
@@ -94,6 +98,7 @@ red-night status
 red-night state                  # one line for scripts: on|off LEVEL
 red-night schedule 22:00 07:00   # a systemd user timer; catches up after sleep or boot
 red-night schedule off
+red-night leds                   # port LEDs off if it is on, as they were if not (what runs at login)
 ```
 
 The tray switch has its own command, for when something looks wrong:
@@ -152,12 +157,23 @@ If powerdevil changed, it rebuilds the copy from the new files and checks that i
 reason, it puts the stock applet back in the tray, removes the copy, writes why to
 `~/.local/state/red-night/tray-error` and sends a notification. Either way you keep the brightness slider.
 
+### The network port LEDs
+
+Drivers like `r8169` run the port LEDs in hardware and expose them as `/sys/class/leds/<port>-N::lan`, driven
+through the `netdev` trigger: activating it reads each LED's mode (link at which speeds, activity) from the hardware,
+and every mode at 0 switches the LED off. When the filter goes on, `red-night` writes down each wired port LED's
+trigger and mode in `~/.local/state/red-night/lan-leds` and sets every mode to 0; when it goes off, it writes them
+back. The udev rule hands those files to you, so this needs no password at the switch, and `red-night-leds.service`
+applies it again at login, because the hardware goes back to its own default at boot. Wi-Fi LEDs and every other LED
+are left alone.
+
 ### Tests
 
 ```sh
 tests/profile-test.py   # generates profiles and reads them back with lcms: red = x·level, green = blue = 0
 tests/screen-test.sh    # THE REAL SCREEN, ~3 s red: on, brighter, dimmer, off, reading the hardware LUT; always reverts
 tests/tray-test.py      # the guard, offline in temporary folders: build, swap, rebuild after an update, back to stock
+tests/lan-leds-test.py  # the port LEDs, offline on a fake /sys/class/leds: off, back exactly as before, after a reboot
 tests/crtc-lut.py       # print the GAMMA_LUT the kernel is scanning out right now (modetest, no root)
 ```
 
@@ -176,6 +192,8 @@ tests/crtc-lut.py       # print the GAMMA_LUT the kernel is scanning out right n
 - **If the popup shows an error instead of the sliders**, for example because plasmashell was restarted by hand right
   after an update, before the guard ran, run `red-night-tray check` or `red-night-tray remove`.
 - **Tested on one machine**, an amdgpu laptop panel. Other drivers and external monitors are untested.
+- **Port LEDs**: only those a driver exposes as `*::lan` with `netdev` hardware offload (tested with `r8169`). Their
+  colour is fixed by the part; they can only be switched off.
 
 ## License
 

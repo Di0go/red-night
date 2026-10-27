@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# The root part of the network port LEDs, run once through pkexec by install.sh and uninstall.sh.
+#
+#   pkexec tools/lan-leds install USER   let USER switch the wired port LEDs (*::lan) on and off
+#   pkexec tools/lan-leds remove         undo it
+#
+# - /etc/udev/rules.d/90-red-night-lan-leds.rules: hands the LED's trigger file to USER, and the
+#   netdev mode files too, each time the trigger changes (the kernel creates them then and
+#   sends a change event)
+# - /etc/modules-load.d/red-night.conf: loads ledtrig-netdev at boot
+set -euo pipefail
+
+RULE=/etc/udev/rules.d/90-red-night-lan-leds.rules
+MODULES=/etc/modules-load.d/red-night.conf
+FILES="trigger link link_10 link_100 link_1000 link_2500 link_5000 link_10000 half_duplex full_duplex rx tx"
+
+retrigger() {
+  udevadm control --reload
+  udevadm trigger --action=change --subsystem-match=leds --sysname-match='*::lan'
+  udevadm settle
+}
+
+case "${1:-}" in
+  install)
+    user="${2:?usage: lan-leds install USER}"
+    id -u "$user" >/dev/null
+    paths=""
+    for f in $FILES; do paths+=" /sys%p/$f"; done
+    cat > "$RULE" <<RULE
+# red-night: let $user switch the wired network port LEDs off while the screen is red.
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="*::lan", RUN+="/usr/bin/chown -f $user$paths"
+RULE
+    echo ledtrig-netdev > "$MODULES"
+    modprobe ledtrig-netdev
+    retrigger
+    ;;
+  remove)
+    rm -f "$RULE" "$MODULES"
+    for d in /sys/class/leds/*::lan; do
+      [ -e "$d/trigger" ] || continue
+      for f in $FILES; do [ -e "$d/$f" ] && chown root "$d/$f"; done
+    done
+    retrigger
+    ;;
+  *)
+    sed -n '2,10p' "$0" >&2
+    exit 2
+    ;;
+esac
